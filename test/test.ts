@@ -32,6 +32,8 @@ import {
   selectZellijStackPlacement,
   normalizeTmuxLaunchMode,
   buildTmuxCreateArgs,
+  buildManagedTmuxSessionName,
+  buildManagedTmuxWindowArgs,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -2244,6 +2246,37 @@ describe("cmux.ts", () => {
         }),
         ["new-window", "-d", "-P", "-F", "#{pane_id}", "-n", "Scout", "-c", "/tmp/project"],
       );
+    });
+  });
+
+  describe("buildManagedTmuxSessionName", () => {
+    it("builds a readable collision-resistant name", () => {
+      assert.equal(
+        buildManagedTmuxSessionName("/work/My Cool Repo", 4242, "q7mk"),
+        "pi-my-cool-repo-4242-q7mk",
+      );
+    });
+
+    it("falls back to a safe slug for empty basenames", () => {
+      assert.equal(buildManagedTmuxSessionName("/", 7, "zz99"), "pi-pi-7-zz99");
+    });
+  });
+
+  describe("buildManagedTmuxWindowArgs", () => {
+    it("builds detached new-window args inside the managed session", () => {
+      assert.deepEqual(buildManagedTmuxWindowArgs("Scout", "pi-repo-4242-q7mk", "/tmp/project"), [
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "pi-repo-4242-q7mk",
+        "-n",
+        "Scout",
+        "-c",
+        "/tmp/project",
+      ]);
     });
   });
 });

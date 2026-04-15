@@ -10,6 +10,11 @@ const execFileAsync = promisify(execFile);
 export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
 export type TmuxLaunchMode = "split" | "window";
 
+interface ManagedTmuxSessionState {
+  name: string;
+  bootstrapWindowName: string;
+}
+
 interface PiInteractiveSubagentsSettings {
   piInteractiveSubagents?: {
     tmuxLaunchMode?: unknown;
@@ -17,6 +22,7 @@ interface PiInteractiveSubagentsSettings {
 }
 
 const commandAvailability = new Map<string, boolean>();
+let managedTmuxSession: ManagedTmuxSessionState | null = null;
 
 function hasCommand(command: string): boolean {
   if (commandAvailability.has(command)) {
@@ -111,13 +117,7 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
-export function getMuxBackend(): MuxBackend | null {
-  const pref = muxPreference();
-  if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
-  if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
-  if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
-  if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
-
+export function getCurrentMuxBackend(): MuxBackend | null {
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
@@ -125,8 +125,39 @@ export function getMuxBackend(): MuxBackend | null {
   return null;
 }
 
+function isManagedTmuxCandidate(): boolean {
+  return !isTmuxRuntimeAvailable() && hasCommand("tmux");
+}
+
+export function getMuxBackend(): MuxBackend | null {
+  const pref = muxPreference();
+  if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
+  if (pref === "tmux") return isTmuxRuntimeAvailable() || hasCommand("tmux") ? "tmux" : null;
+  if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
+  if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+
+  if (isTmuxRuntimeAvailable()) return "tmux";
+  if (isManagedTmuxCandidate()) return "tmux";
+  if (isCmuxRuntimeAvailable()) return "cmux";
+  if (isZellijRuntimeAvailable()) return "zellij";
+  if (isWezTermRuntimeAvailable()) return "wezterm";
+  return null;
+}
+
 export function isMuxAvailable(): boolean {
   return getMuxBackend() !== null;
+}
+
+export function canLaunchSubagents(): boolean {
+  return getMuxBackend() !== null;
+}
+
+export function canSetCurrentTitle(): boolean {
+  return getCurrentMuxBackend() !== null;
+}
+
+export function isManagedTmuxLaunchMode(): boolean {
+  return getMuxBackend() === "tmux" && !isTmuxRuntimeAvailable();
 }
 
 export function muxSetupHint(): string {
@@ -148,6 +179,14 @@ export function muxSetupHint(): string {
 
 function requireMuxBackend(): MuxBackend {
   const backend = getMuxBackend();
+  if (!backend) {
+    throw new Error(`No supported terminal multiplexer found. ${muxSetupHint()}`);
+  }
+  return backend;
+}
+
+function requireCurrentMuxBackend(): MuxBackend {
+  const backend = getCurrentMuxBackend();
   if (!backend) {
     throw new Error(`No supported terminal multiplexer found. ${muxSetupHint()}`);
   }
@@ -773,6 +812,77 @@ function createCmuxSplitSurface(
   }
 }
 
+function tmuxSessionExists(name: string): boolean {
+  try {
+    execFileSync("tmux", ["has-session", "-t", name], { encoding: "utf8", stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function slugifySessionPart(value: string): string {
+  const cleaned = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return cleaned || "pi";
+}
+
+export function buildManagedTmuxSessionName(
+  cwd: string,
+  pid = process.pid,
+  suffix = Math.random().toString(36).slice(2, 6),
+): string {
+  return `pi-${slugifySessionPart(basename(cwd))}-${pid}-${slugifySessionPart(suffix).slice(0, 8)}`;
+}
+
+function ensureManagedTmuxSession(): ManagedTmuxSessionState {
+  if (!isManagedTmuxLaunchMode()) {
+    throw new Error("Managed tmux session is only used when pi is not already inside tmux");
+  }
+
+  if (managedTmuxSession) {
+    if (tmuxSessionExists(managedTmuxSession.name)) {
+      return managedTmuxSession;
+    }
+    managedTmuxSession = null;
+  }
+
+  const bootstrapWindowName = "subagents";
+  let sessionName = "";
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const suffix = Math.random().toString(36).slice(2, 6 + attempt);
+    sessionName = buildManagedTmuxSessionName(process.cwd(), process.pid, suffix);
+    if (!tmuxSessionExists(sessionName)) break;
+    sessionName = "";
+  }
+  if (!sessionName) {
+    throw new Error("Failed to allocate a unique managed tmux session name");
+  }
+
+  execFileSync(
+    "tmux",
+    ["new-session", "-d", "-s", sessionName, "-n", bootstrapWindowName, "-c", process.cwd()],
+    { encoding: "utf8" },
+  );
+
+  managedTmuxSession = { name: sessionName, bootstrapWindowName };
+  return managedTmuxSession;
+}
+
+export function cleanupManagedTmuxSession(): void {
+  if (!managedTmuxSession) return;
+  try {
+    execFileSync("tmux", ["kill-session", "-t", managedTmuxSession.name], { encoding: "utf8" });
+  } catch {
+    // Session may already be gone.
+  } finally {
+    managedTmuxSession = null;
+  }
+}
+
 /**
  * Create a new terminal surface for a subagent.
  *
@@ -860,15 +970,31 @@ export function createSurfaceSplit(
   }
 
   if (backend === "tmux") {
-    const args = buildTmuxCreateArgs(name, direction, {
-      fromSurface,
-      launchMode: getTmuxLaunchMode(),
-      cwd: process.cwd(),
-    });
+    const managedTmuxLaunch = isManagedTmuxLaunchMode();
+    const args = managedTmuxLaunch
+      ? buildManagedTmuxWindowArgs(name, ensureManagedTmuxSession().name, process.cwd())
+      : buildTmuxCreateArgs(name, direction, {
+          fromSurface,
+          launchMode: getTmuxLaunchMode(),
+          cwd: process.cwd(),
+        });
 
     const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
     if (!pane.startsWith("%")) {
       throw new Error(`Unexpected tmux pane output: ${pane}`);
+    }
+
+    if (managedTmuxLaunch) {
+      try {
+        const windowId = execFileSync("tmux", ["display-message", "-p", "-t", pane, "#{window_id}"], {
+          encoding: "utf8",
+        }).trim();
+        if (windowId) {
+          execFileSync("tmux", ["select-window", "-t", windowId], { encoding: "utf8" });
+        }
+      } catch {
+        // Optional — active window selection is best effort.
+      }
     }
 
     return pane;
@@ -963,11 +1089,23 @@ export function buildTmuxCreateArgs(
   return args;
 }
 
+export function buildManagedTmuxWindowArgs(
+  name: string,
+  sessionName: string,
+  cwd?: string,
+): string[] {
+  const args = ["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", sessionName, "-n", name];
+  if (cwd) {
+    args.push("-c", cwd);
+  }
+  return args;
+}
+
 /**
  * Rename the current tab/window.
  */
 export function renameCurrentTab(title: string): void {
-  const backend = requireMuxBackend();
+  const backend = requireCurrentMuxBackend();
 
   if (backend === "cmux") {
     const surfaceId = process.env.CMUX_SURFACE_ID;
@@ -979,9 +1117,6 @@ export function renameCurrentTab(title: string): void {
   }
 
   if (backend === "tmux") {
-    if (process.env.PI_SUBAGENT_RENAME_TMUX_WINDOW !== "1") {
-      return;
-    }
     const paneId = process.env.TMUX_PANE;
     if (!paneId) throw new Error("TMUX_PANE not set");
     const windowId = execFileSync("tmux", ["display-message", "-p", "-t", paneId, "#{window_id}"], {
@@ -1015,7 +1150,7 @@ export function renameCurrentTab(title: string): void {
  * Rename the current workspace/session where supported.
  */
 export function renameWorkspace(title: string): void {
-  const backend = requireMuxBackend();
+  const backend = requireCurrentMuxBackend();
 
   if (backend === "cmux") {
     execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, {
@@ -1025,7 +1160,7 @@ export function renameWorkspace(title: string): void {
   }
 
   if (backend === "tmux") {
-    if (process.env.PI_SUBAGENT_RENAME_TMUX_SESSION !== "1") {
+    if (process.env.PI_SUBAGENT_SESSION && process.env.PI_SUBAGENT_RENAME_TMUX_SESSION !== "1") {
       return;
     }
 
