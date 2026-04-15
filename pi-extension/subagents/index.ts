@@ -19,6 +19,8 @@ import {
   muxSetupHint,
   createSurface,
   sendLongCommand,
+  writeLongCommandScript,
+  launchTmuxScript,
   pollForExit,
   closeSurface,
   getMuxBackend,
@@ -27,6 +29,8 @@ import {
   renameCurrentTab,
   renameWorkspace,
   readScreen,
+  cleanupManagedTmuxSession,
+  canSetCurrentTitle,
 } from "./cmux.ts";
 
 import {
@@ -391,6 +395,27 @@ function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
+
+type LaunchScriptOptions = { scriptPath: string; scriptPreamble: string };
+
+async function launchCommandInSurface(
+  surface: string,
+  command: string,
+  options: LaunchScriptOptions,
+  muxBackend: ReturnType<typeof getMuxBackend>,
+  surfacePreCreated: boolean,
+): Promise<void> {
+  if (muxBackend === "tmux") {
+    writeLongCommandScript(command, options);
+    launchTmuxScript(surface, options.scriptPath);
+    return;
+  }
+
+  if (!surfacePreCreated) {
+    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+  }
+  sendLongCommand(surface, command, options);
 }
 
 function muxUnavailableResult() {
@@ -947,12 +972,9 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  const muxBackend = getMuxBackend();
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1028,14 +1050,20 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
+    await launchCommandInSurface(
+      surface,
+      command,
+      {
+        scriptPath: launchScriptFile,
+        scriptPreamble: [
+          `# Claude Code subagent launch script for ${params.name}`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Surface: ${surface}`,
+        ].join("\n"),
+      },
+      muxBackend,
+      surfacePreCreated,
+    );
 
     const running: RunningSubagent = {
       id,
@@ -1117,6 +1145,7 @@ async function launchSubagent(
   if (agentDefs?.autoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
+  envParts.push(`PI_SUBAGENT_RENAME_TMUX_WINDOW=1`);
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
@@ -1166,15 +1195,21 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
+  await launchCommandInSurface(
+    surface,
+    command,
+    {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${subagentSessionFile}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    },
+    muxBackend,
+    surfacePreCreated,
+  );
 
   const running: RunningSubagent = {
     id,
@@ -1357,6 +1392,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    cleanupManagedTmuxSession();
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1769,7 +1805,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        const muxBackend = getMuxBackend();
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
@@ -1813,6 +1849,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
+        resumeEnvParts.push(`PI_SUBAGENT_RENAME_TMUX_WINDOW=1`);
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -1826,16 +1863,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${params.sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
+        await launchCommandInSurface(
+          surface,
+          command,
+          {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${params.sessionPath}`,
+              `# Surface: ${surface}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+          },
+          muxBackend,
+          false,
+        );
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2121,7 +2164,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       // Rename workspace and tab to show this is a planning session
-      if (isMuxAvailable()) {
+      if (canSetCurrentTitle()) {
         try {
           const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
           renameWorkspace(`🎯 ${label}`);

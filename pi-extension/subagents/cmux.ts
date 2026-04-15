@@ -1273,6 +1273,18 @@ export function sendLongCommand(
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
+  const scriptPath = writeLongCommandScript(command, options);
+  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  return scriptPath;
+}
+
+/**
+ * Write a long command to a script file and return the path.
+ */
+export function writeLongCommandScript(
+  command: string,
+  options?: { scriptPath?: string; scriptPreamble?: string },
+): string {
   const scriptPath =
     options?.scriptPath ??
     join(
@@ -1291,8 +1303,25 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
+}
+
+/**
+ * Launch a script directly in an existing tmux pane/window, replacing the
+ * current shell process instead of typing the command at the prompt.
+ */
+export function launchTmuxScript(surface: string, scriptPath: string): void {
+  try {
+    execFileSync("tmux", ["set-option", "-pt", surface, "remain-on-exit", "on"], {
+      encoding: "utf8",
+    });
+  } catch {
+    // Best effort — if this fails, respawn-pane still launches the process.
+  }
+
+  execFileSync("tmux", ["respawn-pane", "-k", "-t", surface, `bash ${shellEscape(scriptPath)}`], {
+    encoding: "utf8",
+  });
 }
 
 /**
