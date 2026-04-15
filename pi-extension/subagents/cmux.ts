@@ -3,10 +3,18 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { SettingsManager } from "@mariozechner/pi-coding-agent";
 
 const execFileAsync = promisify(execFile);
 
 export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type TmuxLaunchMode = "split" | "window";
+
+interface PiInteractiveSubagentsSettings {
+  piInteractiveSubagents?: {
+    tmuxLaunchMode?: unknown;
+  };
+}
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -45,6 +53,30 @@ function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
   if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
   return null;
+}
+
+export function normalizeTmuxLaunchMode(value: unknown): TmuxLaunchMode | null {
+  return value === "split" || value === "window" ? value : null;
+}
+
+function settingsTmuxLaunchMode(): TmuxLaunchMode | null {
+  try {
+    const settings = SettingsManager.create(process.cwd(), process.env.PI_CODING_AGENT_DIR);
+    const projectSettings = settings.getProjectSettings() as PiInteractiveSubagentsSettings;
+    const projectMode = normalizeTmuxLaunchMode(projectSettings.piInteractiveSubagents?.tmuxLaunchMode);
+    if (projectMode) return projectMode;
+
+    const globalSettings = settings.getGlobalSettings() as PiInteractiveSubagentsSettings;
+    return normalizeTmuxLaunchMode(globalSettings.piInteractiveSubagents?.tmuxLaunchMode);
+  } catch {
+    return null;
+  }
+}
+
+export function getTmuxLaunchMode(): TmuxLaunchMode {
+  const envMode = normalizeTmuxLaunchMode((process.env.PI_SUBAGENT_TMUX_LAUNCH_MODE ?? "").trim().toLowerCase());
+  if (envMode) return envMode;
+  return settingsTmuxLaunchMode() ?? "split";
 }
 
 function isCmuxRuntimeAvailable(): boolean {
@@ -747,7 +779,9 @@ function createCmuxSplitSurface(
  * For cmux: the first call creates a right-split pane; subsequent calls add
  * tabs to that same pane (avoiding ever-narrower splits).
  * For zellij: chooses a tab-aware tiled or stacked placement.
- * For tmux/wezterm: falls back to split behavior.
+ * For tmux: uses split panes by default, or detached windows when
+ * tmuxLaunchMode/window mode is enabled.
+ * For wezterm: falls back to split behavior.
  *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
@@ -809,7 +843,9 @@ function createSurfaceInPane(name: string, pane: string): string {
 }
 
 /**
- * Create a new split in the given direction from an optional source pane.
+ * Create a new tmux/cmux/zellij/wezterm surface from an optional source pane.
+ * Most backends interpret this as a split; tmux may create a detached window
+ * depending on launch mode.
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
 export function createSurfaceSplit(
@@ -824,23 +860,15 @@ export function createSurfaceSplit(
   }
 
   if (backend === "tmux") {
-    const args = ["split-window", "-d"];
-    if (direction === "left" || direction === "right") {
-      args.push("-h");
-    } else {
-      args.push("-v");
-    }
-    if (direction === "left" || direction === "up") {
-      args.push("-b");
-    }
-    if (fromSurface) {
-      args.push("-t", fromSurface);
-    }
-    args.push("-P", "-F", "#{pane_id}");
+    const args = buildTmuxCreateArgs(name, direction, {
+      fromSurface,
+      launchMode: getTmuxLaunchMode(),
+      cwd: process.cwd(),
+    });
 
     const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
     if (!pane.startsWith("%")) {
-      throw new Error(`Unexpected tmux split-window output: ${pane}`);
+      throw new Error(`Unexpected tmux pane output: ${pane}`);
     }
 
     return pane;
@@ -902,6 +930,37 @@ export function createSurfaceSplit(
   }
 
   return surface;
+}
+
+export function buildTmuxCreateArgs(
+  name: string,
+  direction: "left" | "right" | "up" | "down",
+  options?: { fromSurface?: string; launchMode?: TmuxLaunchMode; cwd?: string },
+): string[] {
+  const launchMode = options?.launchMode ?? "split";
+
+  if (launchMode === "window") {
+    const args = ["new-window", "-d", "-P", "-F", "#{pane_id}", "-n", name];
+    if (options?.cwd) {
+      args.push("-c", options.cwd);
+    }
+    return args;
+  }
+
+  const args = ["split-window", "-d"];
+  if (direction === "left" || direction === "right") {
+    args.push("-h");
+  } else {
+    args.push("-v");
+  }
+  if (direction === "left" || direction === "up") {
+    args.push("-b");
+  }
+  if (options?.fromSurface) {
+    args.push("-t", options.fromSurface);
+  }
+  args.push("-P", "-F", "#{pane_id}");
+  return args;
 }
 
 /**

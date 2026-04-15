@@ -30,6 +30,8 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  normalizeTmuxLaunchMode,
+  buildTmuxCreateArgs,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -2192,6 +2194,56 @@ describe("cmux.ts", () => {
     it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("normalizeTmuxLaunchMode", () => {
+    it("accepts split and window", () => {
+      assert.equal(normalizeTmuxLaunchMode("split"), "split");
+      assert.equal(normalizeTmuxLaunchMode("window"), "window");
+    });
+
+    it("rejects unsupported values", () => {
+      assert.equal(normalizeTmuxLaunchMode("pane"), null);
+      assert.equal(normalizeTmuxLaunchMode(undefined), null);
+    });
+  });
+
+  describe("buildTmuxCreateArgs", () => {
+    it("builds split-window args for right split by default", () => {
+      assert.deepEqual(buildTmuxCreateArgs("Scout", "right"), [
+        "split-window",
+        "-d",
+        "-h",
+        "-P",
+        "-F",
+        "#{pane_id}",
+      ]);
+    });
+
+    it("builds split-window args for up split with before flag", () => {
+      assert.deepEqual(buildTmuxCreateArgs("Scout", "up", { fromSurface: "%7" }), [
+        "split-window",
+        "-d",
+        "-v",
+        "-b",
+        "-t",
+        "%7",
+        "-P",
+        "-F",
+        "#{pane_id}",
+      ]);
+    });
+
+    it("builds detached new-window args for window mode", () => {
+      assert.deepEqual(
+        buildTmuxCreateArgs("Scout", "right", {
+          launchMode: "window",
+          cwd: "/tmp/project",
+          fromSurface: "%7",
+        }),
+        ["new-window", "-d", "-P", "-F", "#{pane_id}", "-n", "Scout", "-c", "/tmp/project"],
+      );
     });
   });
 });
