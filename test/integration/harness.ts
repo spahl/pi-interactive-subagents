@@ -78,17 +78,61 @@ function getAgentDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
-function getConfiguredDefaultModel(): string | null {
+function readGlobalSettings(): Record<string, unknown> | null {
   try {
-    const settings = JSON.parse(readFileSync(join(getAgentDir(), "settings.json"), "utf8"));
-    const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : "";
-    const model = typeof settings.defaultModel === "string" ? settings.defaultModel : "";
-    if (!model) return null;
-    if (model.includes("/")) return model;
-    return provider ? `${provider}/${model}` : model;
+    return JSON.parse(readFileSync(join(getAgentDir(), "settings.json"), "utf8")) as Record<string, unknown>;
   } catch {
     return null;
   }
+}
+
+function isConcreteModelPattern(value: string): boolean {
+  return value.trim().length > 0 && !/[?*\[\]]/.test(value);
+}
+
+function testModelScore(model: string): number {
+  const lower = model.toLowerCase();
+  let score = 100;
+
+  // Prefer cheaper/faster entries from the user's configured model scope when
+  // available. The integration prompts are small and do not need opus/pro tiers.
+  if (lower.includes("nano")) score -= 35;
+  if (lower.includes("haiku")) score -= 30;
+  if (lower.includes("mini")) score -= 25;
+  if (lower.includes("flash")) score -= 20;
+  if (lower.includes("lite")) score -= 15;
+  if (lower.includes("opus")) score += 30;
+  if (lower.includes("pro")) score += 15;
+
+  // The opencode.cloudflare.dev.gpt catalog can be narrower than the generic
+  // OpenCode Cloudflare provider. Prefer a generic configured model for tests
+  // unless PI_TEST_MODEL explicitly requests the GPT-only provider.
+  if (lower.startsWith("opencode.cloudflare.dev.gpt/")) score += 20;
+
+  return score;
+}
+
+function getConfiguredEnabledModel(): string | null {
+  const settings = readGlobalSettings();
+  const enabledModels = settings?.enabledModels;
+  if (!Array.isArray(enabledModels)) return null;
+
+  const candidates = enabledModels
+    .filter((model): model is string => typeof model === "string" && isConcreteModelPattern(model));
+  if (candidates.length === 0) return null;
+
+  return candidates
+    .map((model, index) => ({ model, index, score: testModelScore(model) }))
+    .sort((a, b) => a.score - b.score || a.index - b.index)[0]?.model ?? null;
+}
+
+function getConfiguredDefaultModel(): string | null {
+  const settings = readGlobalSettings();
+  const provider = typeof settings?.defaultProvider === "string" ? settings.defaultProvider : "";
+  const model = typeof settings?.defaultModel === "string" ? settings.defaultModel : "";
+  if (!model) return null;
+  if (model.includes("/")) return model;
+  return provider ? `${provider}/${model}` : model;
 }
 
 function discoverSupportExtensionPaths(): string[] {
@@ -120,7 +164,8 @@ function buildExplicitExtensionArgs(): string {
 }
 
 /** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? getConfiguredDefaultModel() ?? FALLBACK_TEST_MODEL;
+export const TEST_MODEL =
+  process.env.PI_TEST_MODEL ?? getConfiguredEnabledModel() ?? getConfiguredDefaultModel() ?? FALLBACK_TEST_MODEL;
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
@@ -166,7 +211,11 @@ export function focusSurface(backend: MuxBackend, surface: string): void {
       encoding: "utf8",
     }).trim();
     if (windowId) {
-      execFileSync("tmux", ["select-window", "-t", windowId], { encoding: "utf8" });
+      try {
+        execFileSync("tmux", ["switch-client", "-t", windowId], { encoding: "utf8" });
+      } catch {
+        execFileSync("tmux", ["select-window", "-t", windowId], { encoding: "utf8" });
+      }
     }
     execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
     return;
@@ -183,20 +232,10 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
 
   if (backend === "tmux") {
     try {
-      const sessionId = execFileSync(
-        "tmux",
-        ["display-message", "-p", "-t", process.env.TMUX_PANE ?? "", "#{session_id}"],
-        { encoding: "utf8" },
-      ).trim();
-      const panes = execFileSync(
-        "tmux",
-        ["list-panes", "-a", "-F", "#{session_id} #{window_active} #{pane_active} #{pane_id}"],
-        { encoding: "utf8" },
-      );
-      const activeLine = panes
-        .split("\n")
-        .find((line) => line.startsWith(`${sessionId} 1 1 `));
-      return activeLine?.split(" ")[3] ?? null;
+      const pane = execFileSync("tmux", ["display-message", "-p", "#{pane_id}"], {
+        encoding: "utf8",
+      }).trim();
+      return pane || null;
     } catch {
       return null;
     }
@@ -350,6 +389,7 @@ export function startPi(
     `-ne`,
     buildExplicitExtensionArgs(),
     `--model ${shellEscape(model)}`,
+    `--models ${shellEscape(model)}`,
     extra,
     shellEscape(task),
   ]
