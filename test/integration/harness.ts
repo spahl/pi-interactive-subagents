@@ -12,16 +12,16 @@ import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
-  cpSync,
   readdirSync,
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   getCurrentMuxBackend,
   createSurface,
@@ -70,11 +70,57 @@ const TEST_AGENTS_SRC = join(HARNESS_DIR, "agents");
  * installed on the host.
  */
 const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.ts");
+const FALLBACK_TEST_MODEL = "anthropic/claude-haiku-4-5";
 
 // ── Configuration ──
 
+function getAgentDir(): string {
+  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+function getConfiguredDefaultModel(): string | null {
+  try {
+    const settings = JSON.parse(readFileSync(join(getAgentDir(), "settings.json"), "utf8"));
+    const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : "";
+    const model = typeof settings.defaultModel === "string" ? settings.defaultModel : "";
+    if (!model) return null;
+    if (model.includes("/")) return model;
+    return provider ? `${provider}/${model}` : model;
+  } catch {
+    return null;
+  }
+}
+
+function discoverSupportExtensionPaths(): string[] {
+  const extensionsDir = join(getAgentDir(), "extensions");
+  if (!existsSync(extensionsDir)) return [];
+
+  const paths: string[] = [];
+  for (const entry of readdirSync(extensionsDir, { withFileTypes: true })) {
+    if (entry.isFile() && /\.[cm]?[jt]s$/.test(entry.name)) {
+      paths.push(join(extensionsDir, entry.name));
+      continue;
+    }
+
+    if (entry.isDirectory()) {
+      const indexPath = join(extensionsDir, entry.name, "index.ts");
+      if (existsSync(indexPath)) paths.push(indexPath);
+    }
+  }
+
+  return paths.filter((path) => path !== EXTENSION_SOURCE);
+}
+
+function buildExplicitExtensionArgs(): string {
+  // Keep -ne so the installed pi-interactive-subagents package cannot shadow
+  // the working tree, but explicitly load local support extensions so custom
+  // providers/auth plugins (for example opencode-cloudflare) remain available.
+  const extensions = [...discoverSupportExtensionPaths(), EXTENSION_SOURCE];
+  return extensions.map((path) => `-e ${shellEscape(path)}`).join(" ");
+}
+
 /** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? getConfiguredDefaultModel() ?? FALLBACK_TEST_MODEL;
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
@@ -116,6 +162,12 @@ export function focusSurface(backend: MuxBackend, surface: string): void {
   }
 
   if (backend === "tmux") {
+    const windowId = execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{window_id}"], {
+      encoding: "utf8",
+    }).trim();
+    if (windowId) {
+      execFileSync("tmux", ["select-window", "-t", windowId], { encoding: "utf8" });
+    }
     execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
     return;
   }
@@ -131,11 +183,20 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
 
   if (backend === "tmux") {
     try {
-      const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
-        encoding: "utf8",
-      });
-      const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
-      return activeLine?.split(" ")[0] ?? null;
+      const sessionId = execFileSync(
+        "tmux",
+        ["display-message", "-p", "-t", process.env.TMUX_PANE ?? "", "#{session_id}"],
+        { encoding: "utf8" },
+      ).trim();
+      const panes = execFileSync(
+        "tmux",
+        ["list-panes", "-a", "-F", "#{session_id} #{window_active} #{pane_active} #{pane_id}"],
+        { encoding: "utf8" },
+      );
+      const activeLine = panes
+        .split("\n")
+        .find((line) => line.startsWith(`${sessionId} 1 1 `));
+      return activeLine?.split(" ")[3] ?? null;
     } catch {
       return null;
     }
@@ -194,11 +255,20 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
   const agentsDir = join(dir, ".pi", "agents");
   mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir
+  // Copy test agent definitions into the project-local agents dir. Keep their
+  // behavior/frontmatter intact, but run them on the same configurable test
+  // model as the parent pi session so installations with custom auth/provider
+  // extensions do not accidentally fall back to Anthropic.
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+        const source = join(TEST_AGENTS_SRC, file);
+        const target = join(agentsDir, file);
+        const content = readFileSync(source, "utf8").replace(
+          /^model:\s*.+$/m,
+          `model: ${TEST_MODEL}`,
+        );
+        writeFileSync(target, content, "utf8");
       }
     }
   }
@@ -278,7 +348,7 @@ export function startPi(
     `cd ${shellEscape(testDir)} &&`,
     `pi`,
     `-ne`,
-    `-e ${shellEscape(EXTENSION_SOURCE)}`,
+    buildExplicitExtensionArgs(),
     `--model ${shellEscape(model)}`,
     extra,
     shellEscape(task),
