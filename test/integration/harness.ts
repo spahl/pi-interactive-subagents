@@ -23,7 +23,7 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
-  getMuxBackend,
+  getCurrentMuxBackend,
   createSurface,
   createSurfaceSplit,
   sendCommand,
@@ -82,24 +82,18 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect which mux backends are actually available in the current environment.
- * Temporarily sets PI_SUBAGENT_MUX to probe each backend.
+ * Detect which mux backends are actually available for the current test process.
+ *
+ * The extension can launch managed tmux sessions when pi is not already inside
+ * a multiplexer, but these integration tests exercise focus and pane semantics
+ * of the caller's active mux. Do not treat managed tmux as an available backend
+ * here, otherwise tests may start real LLM sessions from outside the configured
+ * authenticated pi environment.
  */
 export function getAvailableBackends(): MuxBackend[] {
-  const backends: MuxBackend[] = [];
-  const orig = process.env.PI_SUBAGENT_MUX;
-
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
-    process.env.PI_SUBAGENT_MUX = backend;
-    try {
-      if (getMuxBackend() === backend) backends.push(backend);
-    } catch {}
-  }
-
-  if (orig === undefined) delete process.env.PI_SUBAGENT_MUX;
-  else process.env.PI_SUBAGENT_MUX = orig;
-
-  return backends;
+  const active = getCurrentMuxBackend();
+  if (active === "cmux" || active === "tmux" || active === "zellij") return [active];
+  return [];
 }
 
 export function setBackend(backend: MuxBackend): string | undefined {
